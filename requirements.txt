@@ -1,6 +1,3 @@
-
-python-telegram-bot==21.10
-yt-dlp
-python-dotenv
 fastapi
 uvicorn
+python-telegram-bot==21.6

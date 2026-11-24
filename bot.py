@@ -9,9 +9,9 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
+)
 
-
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN:
@@ -28,6 +28,7 @@ ALLOWED_SITES = [
     "facebook.com",
     "fb.watch",
 ]
+
 
 def valid_video_url(url):
     try:
@@ -86,7 +87,6 @@ telegram_app.add_handler(
 async def startup():
     await telegram_app.initialize()
     await telegram_app.start()
-
     if WEBHOOK_URL:
         await telegram_app.bot.set_webhook(
             url=f"{WEBHOOK_URL.rstrip('/')}/telegram"
@@ -103,7 +103,6 @@ async def shutdown():
 async def telegram_webhook(request: Request):
     if not WEBHOOK_URL:
         raise HTTPException(status_code=503)
-
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
@@ -113,4 +112,3 @@ async def telegram_webhook(request: Request):
 @app.get("/")
 async def home():
     return {"status": "ViralX AI Editor is running"}
-  

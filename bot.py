@@ -9,9 +9,9 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
-)
 
-BOT_TOKEN = os.getenv("9128031239:AAHJkrgFlNhY-PpobFB75FiyIeGgXnWeETQ")
+
+
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN:

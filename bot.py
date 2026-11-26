@@ -1,7 +1,7 @@
 """
 VIRALX AI STUDIO
-Version 1.0 - Phase 1
-Telegram Downloader + Video to Shorts
+Version 1.1 - Phase 1
+Telegram Universal Downloader + Video to Shorts
 FastAPI + Telegram Webhook + yt-dlp + FFmpeg
 """
 
@@ -22,7 +22,7 @@ import imageio_ffmpeg
 
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,6 +40,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+# httpx logs full request URLs at INFO level, and Telegram URLs contain
+# the bot token. Keep these quiet so the token never appears in logs.
+for noisy in ("httpx", "httpcore", "telegram.ext.ExtBot"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
 log = logging.getLogger("viralx")
 
 BOT_TOKEN = (
@@ -69,10 +75,28 @@ MAX_TG_UPLOAD = 49 * 1024 * 1024
 MAX_SOURCE_SIZE = 500 * 1024 * 1024
 MAX_DURATION = 10 * 60 * 60
 
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".flv", ".avi")
+
 URL_PATTERN = re.compile(r"https?://[^\s]+")
 START_TIME = time.time()
 
 JOB_LOCK = asyncio.Semaphore(1)
+
+# Keeps references to background jobs so they are not garbage collected.
+BACKGROUND_TASKS = set()
+
+
+def spawn(coroutine):
+    """Run a long job in the background so the webhook returns instantly."""
+    task = asyncio.create_task(coroutine)
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+    return task
+
+
+class FileTooBig(Exception):
+    pass
+
 
 # =====================================================
 # USER SETTINGS
@@ -115,6 +139,16 @@ def back_menu():
     ])
 
 
+def choose_action_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📥 Download", callback_data="act:download"),
+            InlineKeyboardButton("✂️ Make Shorts", callback_data="act:shorts"),
+        ],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu")],
+    ])
+
+
 def settings_menu(s):
     lengths = [15, 30, 45, 60]
     counts = [1, 2, 3, 5]
@@ -151,52 +185,103 @@ def settings_menu(s):
 
 
 # =====================================================
-# DOWNLOADER
+# UNIVERSAL DOWNLOADER (yt-dlp)
+# Works with YouTube, Instagram, TikTok, Facebook, X/Twitter,
+# Reddit, Vimeo, direct video file links and 1000+ other sites.
 # =====================================================
 
-def download_video(url, folder):
-    if not url.startswith(("http://", "https://")):
-        raise ValueError("Only HTTP and HTTPS links are accepted.")
-
-    output = str(Path(folder) / "%(id)s.%(ext)s")
+def _download_once(url, folder, height):
+    fmt = (
+        f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
+        f"b[height<={height}][ext=mp4]/"
+        f"bv*[height<={height}]+ba/"
+        f"b[height<={height}]/"
+        f"best"
+    )
 
     options = {
-        "outtmpl": output,
-        "format": "best[height<=1080]/best",
+        "outtmpl": str(Path(folder) / "dl.%(ext)s"),
+        "format": fmt,
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "ffmpeg_location": FFMPEG,
-        "retries": 2,
+        "retries": 3,
+        "fragment_retries": 3,
         "socket_timeout": 30,
         "max_filesize": MAX_SOURCE_SIZE,
+        "restrictfilenames": True,
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
 
-    path = Path(filename)
+    if info is None:
+        raise ValueError("The link did not return any video information.")
 
-    requested = info.get("requested_downloads") or []
-    if requested and requested[0].get("filepath"):
-        path = Path(requested[0]["filepath"])
+    if info.get("entries"):
+        entries = [e for e in info["entries"] if e]
+        if entries:
+            info = entries[0]
 
-    if not path.exists():
-        candidates = list(Path(folder).glob(f"{info['id']}.*"))
-        candidates = [
-            p for p in candidates
-            if p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")
-        ]
-        if not candidates:
-            raise FileNotFoundError("Downloaded video file not found.")
-        path = candidates[0]
+    candidates = [
+        p for p in Path(folder).glob("dl.*")
+        if p.suffix.lower() in VIDEO_EXTENSIONS
+    ]
+
+    if not candidates:
+        raise ValueError(
+            "No video could be downloaded. The post may contain only "
+            "images, or the video exceeds the 500 MB server limit."
+        )
+
+    path = max(candidates, key=lambda p: p.stat().st_size)
 
     if path.stat().st_size > MAX_SOURCE_SIZE:
         raise ValueError("Video exceeds the configured size limit.")
 
-    return str(path), info.get("title") or "Video"
+    return path, info.get("title") or "Video"
+
+
+def _clear_downloads(folder):
+    for old in Path(folder).glob("dl.*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def download_video(url, folder, heights=(1080,), fit_limit=None):
+    """
+    Download a video. When fit_limit is set, quality is lowered step by
+    step until the file fits under that size (used for Telegram upload).
+    """
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("Only HTTP and HTTPS links are accepted.")
+
+    last_error = None
+
+    for height in heights:
+        _clear_downloads(folder)
+
+        try:
+            path, title = _download_once(url, folder, height)
+        except Exception as error:
+            last_error = error
+            # Only try a lower quality when the format was the problem.
+            if "format" in str(error).lower() and height != heights[-1]:
+                continue
+            raise
+
+        if fit_limit is None or path.stat().st_size <= fit_limit:
+            return str(path), title
+
+        last_error = FileTooBig(
+            "File is too big for Telegram even at the lowest quality."
+        )
+
+    raise last_error or FileTooBig("Video could not be downloaded.")
 
 
 # =====================================================
@@ -303,10 +388,8 @@ def select_clips(points, duration, length, count):
     candidates = []
 
     for start in range(last_start + 1):
-        score = (
-            prefix[start + length] - prefix[start]
-        ) / max(length, 1)
-
+        end = min(start + length, len(energy))
+        score = (prefix[end] - prefix[start]) / max(length, 1)
         candidates.append((score, start))
 
     candidates.sort(reverse=True)
@@ -393,11 +476,16 @@ def render_short(source, start, length, destination, style):
 def readable_error(error):
     message = str(error)
 
+    if isinstance(error, FileTooBig):
+        return (
+            "This video is too big to send through Telegram, even at the "
+            "lowest quality. Try a shorter video."
+        )
+
     if "Sign in to confirm" in message or "429" in message:
         return (
             "YouTube refused this server request. "
-            "Try an authorized video upload or another supported source. "
-            "Cookies cannot guarantee access."
+            "Try an authorized video upload or another supported source."
         )
 
     if "Unsupported URL" in message:
@@ -406,8 +494,8 @@ def readable_error(error):
     if "Private video" in message or "login" in message.lower():
         return "This video is private or requires authorization."
 
-    if "too large" in message.lower():
-        return "This video exceeds the configured server size limit."
+    if isinstance(error, subprocess.CalledProcessError):
+        return "Video rendering failed. The file may be damaged or unsupported."
 
     return "Processing failed: " + message[:250]
 
@@ -436,7 +524,7 @@ async def process_job(
     async def update_status(message):
         try:
             await status.edit_text(message)
-        except BadRequest:
+        except TelegramError:
             pass
 
     try:
@@ -461,10 +549,19 @@ async def process_job(
                     "🌐 Downloading from supported source..."
                 )
 
+                if action == "download":
+                    heights = (1080, 720, 480, 360, 240)
+                    fit_limit = MAX_TG_UPLOAD
+                else:
+                    heights = (1080,)
+                    fit_limit = None
+
                 source, title = await asyncio.to_thread(
                     download_video,
                     url,
                     temp_folder,
+                    heights,
+                    fit_limit,
                 )
 
             duration = await asyncio.to_thread(
@@ -478,27 +575,20 @@ async def process_job(
                 )
 
             if action == "download":
-                size = os.path.getsize(source)
+                await update_status("📤 Sending your video...")
 
-                if size > MAX_TG_UPLOAD:
-                    await update_status(
-                        "⚠️ Video exceeds Telegram's upload limit."
+                with open(source, "rb") as video:
+                    await bot.send_video(
+                        chat_id,
+                        video=video,
+                        caption=title[:200],
+                        supports_streaming=True,
+                        read_timeout=300,
+                        write_timeout=300,
+                        connect_timeout=60,
                     )
-                else:
-                    await update_status("📤 Sending your video...")
 
-                    with open(source, "rb") as video:
-                        await bot.send_video(
-                            chat_id,
-                            video=video,
-                            caption=title[:200],
-                            supports_streaming=True,
-                            read_timeout=300,
-                            write_timeout=300,
-                            connect_timeout=60,
-                        )
-
-                    await update_status("✅ Download complete!")
+                await update_status("✅ Download complete!")
 
             else:
                 await update_status(
@@ -577,11 +667,14 @@ async def process_job(
     finally:
         shutil.rmtree(temp_folder, ignore_errors=True)
 
-    await bot.send_message(
-        chat_id,
-        "What would you like to do next?",
-        reply_markup=main_menu(),
-    )
+    try:
+        await bot.send_message(
+            chat_id,
+            "What would you like to do next?",
+            reply_markup=main_menu(),
+        )
+    except TelegramError:
+        pass
 
 
 # =====================================================
@@ -594,7 +687,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "🚀 WELCOME TO VIRALX AI STUDIO\n\n"
         "Your video downloader and Shorts creation workspace.\n\n"
-        "Choose a service below:",
+        "Choose a service below, or simply send a video link:",
         reply_markup=main_menu(),
     )
 
@@ -615,112 +708,19 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
-    data = query.data
+    # Old buttons (pressed after a restart) make Telegram return
+    # "Query is too old". That must never break the handler.
+    try:
+        await query.answer()
+    except TelegramError:
+        pass
+
+    data = query.data or ""
     user_data = context.user_data
     s = get_settings(user_data)
 
     async def edit(message, keyboard=None):
         try:
             await query.message.edit_text(
-                message,
-                reply_markup=keyboard,
-            )
-        except BadRequest:
-            pass
-
-    if data == "menu":
-        user_data["mode"] = None
-        await edit(
-            "🚀 VIRALX AI STUDIO\n\nChoose your service:",
-            main_menu(),
-        )
-
-    elif data.startswith("mode:"):
-        mode = data.split(":")[1]
-
-        user_data["mode"] = (
-            "shorts" if mode == "live" else mode
-        )
-
-        if mode == "download":
-            message = (
-                "📥 VIDEO DOWNLOADER\n\n"
-                "Send a supported video link."
-            )
-        elif mode == "live":
-            message = (
-                "📡 RECORDING TO SHORTS\n\n"
-                "Send an accessible recording link or upload a recording.\n"
-                "This processes recordings, not an active live stream."
-            )
-        else:
-            message = (
-                "✂️ VIDEO TO SHORTS\n\n"
-                "Send a video link or upload a video.\n\n"
-                f"Current settings: {s['count']} clips × "
-                f"{s['length']} seconds."
-            )
-
-        await edit(message, back_menu())
-
-    elif data == "settings":
-        await edit(
-            "🎛 EDITOR SETTINGS\n\n"
-            "Choose clip duration, clip count and framing:",
-            settings_menu(s),
-        )
-
-    elif data.startswith("len:"):
-        s["length"] = int(data.split(":")[1])
-        await edit("✅ Clip duration updated.", settings_menu(s))
-
-    elif data.startswith("count:"):
-        s["count"] = int(data.split(":")[1])
-        await edit("✅ Clip count updated.", settings_menu(s))
-
-    elif data.startswith("style:"):
-        s["style"] = data.split(":")[1]
-        await edit("✅ Framing style updated.", settings_menu(s))
-
-    elif data == "autopilot":
-        await edit(
-            "🤖 AUTOPILOT\n\n"
-            "Automatic publishing is not connected yet.\n"
-            "Official platform API connections are required.",
-            back_menu(),
-        )
-
-    elif data == "publish":
-        await edit(
-            "📤 PUBLISHING CENTER\n\n"
-            "YouTube, TikTok and Facebook publishing "
-            "require official platform API connections.",
-            back_menu(),
-        )
-
-    elif data == "status":
-        uptime = int(time.time() - START_TIME)
-
-        await edit(
-            "📊 VIRALX SYSTEM STATUS\n\n"
-            "System: Online\n"
-            f"Uptime: {uptime // 3600}h "
-            f"{(uptime % 3600) // 60}m\n"
-            f"Resolution: {OUT_W}x{OUT_H}\n"
-            f"Clip length: {s['length']} seconds\n"
-            f"Clip count: {s['count']}\n"
-            f"Frame style: {s['style']}\n"
-            "Video engine: FFmpeg\n"
-            "Downloader: yt-dlp",
-            back_menu(),
-        )
-
-
-# =====================================================
-# URL AND VIDEO HANDLERS
-# =====================================================
-
-async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    
+   

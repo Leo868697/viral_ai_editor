@@ -1,422 +1,726 @@
 """
-ViralX AI Editor & Universal Link Downloader  (Step 1 + 2)
-
-Webhook-only Telegram bot for Render.
-Features: English button menu, video download, Shorts creation (9:16 clips),
-editor settings. Publishing / captions arrive in later steps.
+VIRALX AI STUDIO
+Version 1.0 - Phase 1
+Telegram Downloader + Video to Shorts
+FastAPI + Telegram Webhook + yt-dlp + FFmpeg
 """
-import asyncio
-import logging
+
 import os
 import re
-import shutil
-import subprocess
-import tempfile
 import time
-from contextlib import asynccontextmanager
-from pathlib import Path
+import asyncio
+import logging
+import shutil
+import tempfile
+import subprocess
 
-import imageio_ffmpeg
+from pathlib import Path
+from contextlib import asynccontextmanager
+
 import yt_dlp
+import imageio_ffmpeg
+
 from fastapi import FastAPI, Request, Response
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
-    ContextTypes,
+    CallbackQueryHandler,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# =====================================================
+# CONFIGURATION
+# =====================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger("viralx")
 
-# ---------------------------------------------------------------- config
 BOT_TOKEN = (
-    os.environ.get("BOT_TOKEN")
-    or os.environ.get("TELEGRAM_BOT_TOKEN")
-    or os.environ.get("TELEGRAM_TOKEN")
-    or os.environ.get("TOKEN")
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("TOKEN")
 )
-if not BOT_TOKEN:
-    raise RuntimeError("Set BOT_TOKEN in Render > Environment")
 
-BASE_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-OUT_W = int(os.environ.get("OUT_W", "720"))     # free plan is slow: 720x1280
-OUT_H = int(os.environ.get("OUT_H", "1280"))    # set 1080 / 1920 on a paid plan
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing in Render Environment")
+
+BASE_URL = (
+    os.getenv("PUBLIC_URL")
+    or os.getenv("RENDER_EXTERNAL_URL", "")
+).rstrip("/")
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-MAX_TG_UPLOAD = 49 * 1024 * 1024     # bots can send up to 50 MB
-MAX_TG_DOWNLOAD = 20 * 1024 * 1024   # bots can download up to 20 MB
-URL_RE = re.compile(r"https?://\S+")
+OUT_W = 720
+OUT_H = 1280
+
+MAX_TG_DOWNLOAD = 20 * 1024 * 1024
+MAX_TG_UPLOAD = 49 * 1024 * 1024
+MAX_SOURCE_SIZE = 500 * 1024 * 1024
+MAX_DURATION = 10 * 60 * 60
+
+URL_PATTERN = re.compile(r"https?://[^\s]+")
 START_TIME = time.time()
-JOB_LOCK = asyncio.Semaphore(1)      # one heavy job at a time (512 MB RAM)
 
-# Optional YouTube cookies (fixes "Sign in to confirm you're not a bot")
-COOKIE_FILE = None
-for src_cookie in ("/etc/secrets/cookies.txt", None):
-    if src_cookie and Path(src_cookie).exists():
-        shutil.copy(src_cookie, "/tmp/yt_cookies.txt")
-        COOKIE_FILE = "/tmp/yt_cookies.txt"
-if not COOKIE_FILE and os.environ.get("YT_COOKIES"):
-    Path("/tmp/yt_cookies.txt").write_text(os.environ["YT_COOKIES"])
-    COOKIE_FILE = "/tmp/yt_cookies.txt"
+JOB_LOCK = asyncio.Semaphore(1)
 
-MENU_TEXT = (
-    "👋 Welcome to ViralX AI Editor!\n\n"
-    "Paste a video link (YouTube, TikTok, Instagram, Facebook, X...) "
-    "or upload a video, and I will download it or turn it into Shorts.\n\n"
-    "Choose an option:"
-)
+# =====================================================
+# USER SETTINGS
+# =====================================================
+
+DEFAULT_SETTINGS = {
+    "length": 30,
+    "count": 3,
+    "style": "fill",
+}
 
 
-# ---------------------------------------------------------------- keyboards
+def get_settings(user_data):
+    if "settings" not in user_data:
+        user_data["settings"] = DEFAULT_SETTINGS.copy()
+    return user_data["settings"]
+
+
+# =====================================================
+# TELEGRAM MENUS
+# =====================================================
+
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 Download Video", callback_data="mode:download")],
-        [InlineKeyboardButton("✂️ Create Shorts", callback_data="mode:shorts")],
+        [InlineKeyboardButton("✂️ Video to Shorts", callback_data="mode:shorts")],
+        [InlineKeyboardButton("📡 Recording to Shorts", callback_data="mode:live")],
         [InlineKeyboardButton("🎛 Editor Settings", callback_data="settings")],
-        [InlineKeyboardButton("🤖 Autopilot", callback_data="autopilot"),
-         InlineKeyboardButton("📤 Publish", callback_data="publish")],
-        [InlineKeyboardButton("📊 Status", callback_data="status")],
+        [
+            InlineKeyboardButton("🤖 Autopilot", callback_data="autopilot"),
+            InlineKeyboardButton("📤 Publish", callback_data="publish"),
+        ],
+        [InlineKeyboardButton("📊 System Status", callback_data="status")],
     ])
 
 
-def back_kb():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to menu", callback_data="menu")]])
-
-
-def settings_kb(s):
-    def mark(ok, label):
-        return ("✅ " if ok else "") + label
-
+def back_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(mark(s["length"] == n, f"{n}s"), callback_data=f"len:{n}") for n in (15, 30, 45, 60)],
-        [InlineKeyboardButton(mark(s["count"] == n, f"{n} clips"), callback_data=f"cnt:{n}") for n in (1, 2, 3, 5)],
-        [InlineKeyboardButton(mark(s["style"] == "fill", "Fill frame"), callback_data="style:fill"),
-         InlineKeyboardButton(mark(s["style"] == "blur", "Blur background"), callback_data="style:blur")],
-        [InlineKeyboardButton("⬅️ Back to menu", callback_data="menu")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu")]
     ])
 
 
-def get_settings(ud):
-    return ud.setdefault("settings", {"length": 30, "count": 3, "style": "fill"})
+def settings_menu(s):
+    lengths = [15, 30, 45, 60]
+    counts = [1, 2, 3, 5]
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                ("✅ " if s["length"] == n else "") + f"{n}s",
+                callback_data=f"len:{n}",
+            )
+            for n in lengths
+        ],
+        [
+            InlineKeyboardButton(
+                ("✅ " if s["count"] == n else "") + f"{n} Clips",
+                callback_data=f"count:{n}",
+            )
+            for n in counts
+        ],
+        [
+            InlineKeyboardButton(
+                ("✅ " if s["style"] == "fill" else "") + "Fill",
+                callback_data="style:fill",
+            ),
+            InlineKeyboardButton(
+                ("✅ " if s["style"] == "blur" else "") + "Blur",
+                callback_data="style:blur",
+            ),
+        ],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu")],
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
 
 
-# ---------------------------------------------------------------- media helpers (blocking)
-def friendly_error(e):
-    m = str(e)
-    if "Sign in to confirm" in m or "429" in m:
-        return ("YouTube blocked this server (bot check). Add YouTube cookies in Render "
-                "(YT_COOKIES), or upload the video file directly (max 20 MB).")
-    if "Private video" in m or "login" in m.lower():
-        return "This video is private or needs a login."
-    if "Unsupported URL" in m:
-        return "This link is not supported."
-    return "Download failed: " + m[:300]
+# =====================================================
+# DOWNLOADER
+# =====================================================
 
+def download_video(url, folder):
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("Only HTTP and HTTPS links are accepted.")
 
-def ydl_download(url, outdir, max_height=720):
-    opts = {
-        "outtmpl": str(Path(outdir) / "%(id)s.%(ext)s"),
-        "format": f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b",
+    output = str(Path(folder) / "%(id)s.%(ext)s")
+
+    options = {
+        "outtmpl": output,
+        "format": "best[height<=1080]/best",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "ffmpeg_location": FFMPEG,
-        "retries": 3,
+        "retries": 2,
         "socket_timeout": 30,
+        "max_filesize": MAX_SOURCE_SIZE,
     }
-    if COOKIE_FILE:
-        opts["cookiefile"] = COOKIE_FILE
-    with yt_dlp.YoutubeDL(opts) as ydl:
+
+    with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
-        path = ydl.prepare_filename(info)
-    rd = info.get("requested_downloads")
-    if rd and rd[0].get("filepath"):
-        path = rd[0]["filepath"]
-    p = Path(path)
-    if not p.exists():
-        alt = p.with_suffix(".mp4")
-        if not alt.exists():
-            raise FileNotFoundError("Downloaded file not found")
-        p = alt
-    return str(p), (info.get("title") or "video")
+        filename = ydl.prepare_filename(info)
+
+    path = Path(filename)
+
+    requested = info.get("requested_downloads") or []
+    if requested and requested[0].get("filepath"):
+        path = Path(requested[0]["filepath"])
+
+    if not path.exists():
+        candidates = list(Path(folder).glob(f"{info['id']}.*"))
+        candidates = [
+            p for p in candidates
+            if p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")
+        ]
+        if not candidates:
+            raise FileNotFoundError("Downloaded video file not found.")
+        path = candidates[0]
+
+    if path.stat().st_size > MAX_SOURCE_SIZE:
+        raise ValueError("Video exceeds the configured size limit.")
+
+    return str(path), info.get("title") or "Video"
 
 
-def video_duration(path):
-    r = subprocess.run([FFMPEG, "-i", path], capture_output=True, text=True)
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr)
-    if not m:
-        return 0.0
-    h, mi, s = m.groups()
-    return int(h) * 3600 + int(mi) * 60 + float(s)
+# =====================================================
+# VIDEO INFORMATION
+# =====================================================
 
-
-def loudness_profile(path):
-    """Momentary loudness over time. Louder = more exciting moment."""
-    p = subprocess.run(
-        [FFMPEG, "-nostats", "-i", path, "-vn", "-af", "ebur128=framelog=verbose", "-f", "null", "-"],
-        capture_output=True, text=True,
+def get_duration(path):
+    result = subprocess.run(
+        [FFMPEG, "-i", path],
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
-    pts = []
-    for line in p.stderr.splitlines():
-        m = re.search(r"\bt:\s*([\d.]+).*?\bM:\s*(-?(?:\d+\.?\d*|inf))", line)
-        if m:
-            pts.append((float(m.group(1)), max(float(m.group(2)), -120.0)))
-    return pts
+
+    match = re.search(
+        r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
+        result.stderr,
+    )
+
+    if not match:
+        raise ValueError("Unable to read video duration.")
+
+    hours, minutes, seconds = match.groups()
+
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + float(seconds)
+    )
 
 
-def pick_windows(pts, duration, length, count):
-    length = int(length)
-    if duration <= length + 1:
+# =====================================================
+# AUDIO ANALYSIS
+# Finds louder moments as a basic highlight signal.
+# This is not semantic AI highlight detection.
+# =====================================================
+
+def detect_audio_peaks(path):
+    result = subprocess.run(
+        [
+            FFMPEG,
+            "-hide_banner",
+            "-nostats",
+            "-i", path,
+            "-vn",
+            "-af", "ebur128=framelog=verbose",
+            "-f", "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+
+    points = []
+
+    for line in result.stderr.splitlines():
+        match = re.search(
+            r"\bt:\s*([\d.]+).*?\bM:\s*(-?\d+(?:\.\d+)?)",
+            line,
+        )
+
+        if match:
+            points.append((
+                float(match.group(1)),
+                float(match.group(2)),
+            ))
+
+    return points
+
+
+def select_clips(points, duration, length, count):
+    length = min(int(length), int(duration))
+
+    if duration <= length:
         return [(0.0, max(1.0, duration))]
-    last_start = int(duration) - length
-    if not pts:  # no audio: spread evenly
-        step = max(1, last_start // max(1, count))
-        return [(float(i * step), float(length)) for i in range(count) if i * step <= last_start]
-    n = int(duration)
-    buckets = [[] for _ in range(n + 1)]
-    for t, v in pts:
-        i = int(t)
-        if i <= n:
-            buckets[i].append(v)
-    energy = [(sum(b) / len(b)) if b else -120.0 for b in buckets]
-    pre = [0.0]
-    for e in energy:
-        pre.append(pre[-1] + e)
-    cands = [((pre[s + length] - pre[s]) / length, s) for s in range(0, last_start + 1)]
-    cands.sort(reverse=True)
-    chosen = []
-    for _, s in cands:
-        if all(abs(s - c) >= length for c in chosen):
-            chosen.append(s)
-        if len(chosen) == count:
+
+    last_start = int(duration - length)
+
+    if not points:
+        step = max(1, last_start // max(count, 1))
+        return [
+            (float(i * step), float(length))
+            for i in range(count)
+            if i * step <= last_start
+        ]
+
+    buckets = [[] for _ in range(int(duration) + 1)]
+
+    for timestamp, loudness in points:
+        index = int(timestamp)
+        if 0 <= index < len(buckets):
+            buckets[index].append(loudness)
+
+    energy = [
+        sum(bucket) / len(bucket) if bucket else -120.0
+        for bucket in buckets
+    ]
+
+    prefix = [0.0]
+    for value in energy:
+        prefix.append(prefix[-1] + value)
+
+    candidates = []
+
+    for start in range(last_start + 1):
+        score = (
+            prefix[start + length] - prefix[start]
+        ) / max(length, 1)
+
+        candidates.append((score, start))
+
+    candidates.sort(reverse=True)
+
+    selected = []
+
+    for score, start in candidates:
+        if all(
+            abs(start - previous) >= length
+            for previous in selected
+        ):
+            selected.append(start)
+
+        if len(selected) >= count:
             break
-    chosen.sort()
-    return [(float(s), float(length)) for s in chosen]
+
+    selected.sort()
+
+    return [
+        (float(start), float(length))
+        for start in selected
+    ]
 
 
-def make_clip(src, start, length, dest, style):
-    W, H = OUT_W, OUT_H
-    base = [FFMPEG, "-y", "-ss", str(start), "-t", str(length), "-i", src]
+# =====================================================
+# SHORTS RENDER ENGINE
+# =====================================================
+
+def render_short(source, start, length, destination, style):
+    base = [
+        FFMPEG,
+        "-y",
+        "-ss", str(start),
+        "-i", source,
+        "-t", str(length),
+    ]
+
     if style == "blur":
-        fc = (f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=20:5[bg];"
-              f"[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];"
-              f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v]")
-        vid = ["-filter_complex", fc, "-map", "[v]", "-map", "0:a?"]
+        video_filter = (
+            f"[0:v]scale={OUT_W}:{OUT_H}:"
+            f"force_original_aspect_ratio=increase,"
+            f"crop={OUT_W}:{OUT_H},boxblur=20:5[bg];"
+            f"[0:v]scale={OUT_W}:{OUT_H}:"
+            f"force_original_aspect_ratio=decrease[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
+        )
+
+        video_options = [
+            "-filter_complex", video_filter,
+            "-map", "[v]",
+            "-map", "0:a?",
+        ]
     else:
-        vid = ["-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"]
-    enc = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "27", "-pix_fmt", "yuv420p",
-           "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", dest]
-    subprocess.run(base + vid + enc, check=True, capture_output=True, timeout=1800)
+        video_options = [
+            "-vf",
+            f"scale={OUT_W}:{OUT_H}:"
+            f"force_original_aspect_ratio=increase,"
+            f"crop={OUT_W}:{OUT_H}",
+        ]
+
+    encoding = [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "27",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        destination,
+    ]
+
+    subprocess.run(
+        base + video_options + encoding,
+        check=True,
+        capture_output=True,
+        timeout=1800,
+    )
 
 
-# ---------------------------------------------------------------- jobs
-async def run_job(bot, chat_id, ud, action, url=None, file_id=None):
-    s = get_settings(ud)
-    if JOB_LOCK.locked():
-        await bot.send_message(chat_id, "⏳ Another job is running. Yours will start right after it.")
-    async with JOB_LOCK:
-        status = await bot.send_message(chat_id, "⏬ Getting your video...")
-        tmp = tempfile.mkdtemp(prefix="vx_")
+# =====================================================
+# ERROR MESSAGES
+# =====================================================
 
-        async def say(text):
-            try:
-                await status.edit_text(text)
-            except BadRequest:
-                pass
+def readable_error(error):
+    message = str(error)
 
+    if "Sign in to confirm" in message or "429" in message:
+        return (
+            "YouTube refused this server request. "
+            "Try an authorized video upload or another supported source. "
+            "Cookies cannot guarantee access."
+        )
+
+    if "Unsupported URL" in message:
+        return "This link is not supported by the downloader."
+
+    if "Private video" in message or "login" in message.lower():
+        return "This video is private or requires authorization."
+
+    if "too large" in message.lower():
+        return "This video exceeds the configured server size limit."
+
+    return "Processing failed: " + message[:250]
+
+
+# =====================================================
+# MAIN PROCESSING JOB
+# =====================================================
+
+async def process_job(
+    bot,
+    chat_id,
+    user_data,
+    action,
+    url=None,
+    file_id=None,
+):
+    s = get_settings(user_data)
+
+    status = await bot.send_message(
+        chat_id,
+        "⏳ Your job is waiting...",
+    )
+
+    temp_folder = tempfile.mkdtemp(prefix="viralx_")
+
+    async def update_status(message):
         try:
-            if file_id:
-                f = await bot.get_file(file_id)
-                src = str(Path(tmp) / "input.mp4")
-                await f.download_to_drive(src)
-                title = "Uploaded video"
-            else:
-                src, title = await asyncio.to_thread(ydl_download, url, tmp)
-
-            if action == "download":
-                size = os.path.getsize(src)
-                if size > MAX_TG_UPLOAD:
-                    await say(f"⚠️ Video is {size // 1048576} MB. Telegram bots can send max 50 MB. "
-                              "Use ✂️ Create Shorts instead.")
-                else:
-                    await say("📤 Sending video...")
-                    with open(src, "rb") as fh:
-                        await bot.send_video(chat_id, video=fh, caption=title[:200], supports_streaming=True,
-                                             read_timeout=300, write_timeout=300, connect_timeout=60)
-                    await say("✅ Done!")
-            else:
-                dur = await asyncio.to_thread(video_duration, src)
-                await say("🔎 Finding the best moments...")
-                pts = await asyncio.to_thread(loudness_profile, src)
-                windows = pick_windows(pts, dur, s["length"], s["count"])
-                sent = 0
-                for i, (st, ln) in enumerate(windows, 1):
-                    await say(f"🎬 Rendering Short {i}/{len(windows)}...")
-                    dest = str(Path(tmp) / f"short_{i}.mp4")
-                    await asyncio.to_thread(make_clip, src, st, ln, dest, s["style"])
-                    if os.path.getsize(dest) > MAX_TG_UPLOAD:
-                        await bot.send_message(chat_id, f"⚠️ Short {i} is over 50 MB, skipped.")
-                        continue
-                    with open(dest, "rb") as fh:
-                        await bot.send_video(chat_id, video=fh, width=OUT_W, height=OUT_H, duration=int(ln),
-                                             caption=f"Short {i}/{len(windows)} • from {int(st)}s",
-                                             supports_streaming=True,
-                                             read_timeout=300, write_timeout=300, connect_timeout=60)
-                    sent += 1
-                await say(f"✅ Done! {sent} Short(s) sent.")
-        except Exception as e:  # noqa: BLE001
-            log.exception("job failed")
-            await say("❌ " + friendly_error(e))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-    await bot.send_message(chat_id, "What next?", reply_markup=main_menu())
-
-
-# ---------------------------------------------------------------- handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["mode"] = None
-    await update.effective_message.reply_text(MENU_TEXT, reply_markup=main_menu())
-
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    d = q.data
-    ud = context.user_data
-    s = get_settings(ud)
-
-    async def edit(text, kb):
-        try:
-            await q.message.edit_text(text, reply_markup=kb)
+            await status.edit_text(message)
         except BadRequest:
             pass
 
-    settings_text = ("🎛 Editor Settings\n\nClip length, clips per video and framing.\n"
-                     "Captions, music and branding come in the next step.")
+    try:
+        async with JOB_LOCK:
+            await update_status("📥 Receiving your video...")
 
-    if d == "menu":
-        ud["mode"] = None
-        await edit(MENU_TEXT, main_menu())
-    elif d.startswith("mode:"):
-        ud["mode"] = d.split(":")[1]
-        if ud["mode"] == "download":
-            await edit("📥 Download Video\n\nSend me a video link.", back_kb())
-        else:
-            await edit(f"✂️ Create Shorts\n\nSend a video link, or upload a video (max 20 MB).\n"
-                       f"Current: {s['count']} clips × {s['length']}s.", back_kb())
-    elif d == "settings":
-        await edit(settings_text, settings_kb(s))
-    elif d.startswith("len:"):
-        s["length"] = int(d.split(":")[1])
-        await edit(settings_text, settings_kb(s))
-    elif d.startswith("cnt:"):
-        s["count"] = int(d.split(":")[1])
-        await edit(settings_text, settings_kb(s))
-    elif d.startswith("style:"):
-        s["style"] = d.split(":")[1]
-        await edit(settings_text, settings_kb(s))
-    elif d == "autopilot":
-        ud["autopilot"] = not ud.get("autopilot", False)
-        await edit(f"🤖 Autopilot: {'ON' if ud['autopilot'] else 'OFF'}\n\n"
-                   "⚠️ Auto-publishing is not connected yet (Step 3). For now this switch only saves "
-                   "your choice. Nothing is posted automatically.", back_kb())
-    elif d == "publish":
-        await edit("📤 Publish\n\nPosting to YouTube Shorts, TikTok and Facebook Reels comes in Step 3 "
-                   "and needs your official API keys. Until then, Shorts are sent to you in this chat.",
-                   back_kb())
-    elif d == "status":
-        up = int(time.time() - START_TIME)
+            if file_id:
+                telegram_file = await bot.get_file(file_id)
+
+                source = str(
+                    Path(temp_folder) / "uploaded_video.mp4"
+                )
+
+                await telegram_file.download_to_drive(
+                    custom_path=source
+                )
+
+                title = "Uploaded Video"
+
+            else:
+                await update_status(
+                    "🌐 Downloading from supported source..."
+                )
+
+                source, title = await asyncio.to_thread(
+                    download_video,
+                    url,
+                    temp_folder,
+                )
+
+            duration = await asyncio.to_thread(
+                get_duration,
+                source,
+            )
+
+            if duration <= 0 or duration > MAX_DURATION:
+                raise ValueError(
+                    "Video must be between 1 second and 10 hours."
+                )
+
+            if action == "download":
+                size = os.path.getsize(source)
+
+                if size > MAX_TG_UPLOAD:
+                    await update_status(
+                        "⚠️ Video exceeds Telegram's upload limit."
+                    )
+                else:
+                    await update_status("📤 Sending your video...")
+
+                    with open(source, "rb") as video:
+                        await bot.send_video(
+                            chat_id,
+                            video=video,
+                            caption=title[:200],
+                            supports_streaming=True,
+                            read_timeout=300,
+                            write_timeout=300,
+                            connect_timeout=60,
+                        )
+
+                    await update_status("✅ Download complete!")
+
+            else:
+                await update_status(
+                    "🔎 Analysing audio and finding clip moments..."
+                )
+
+                points = await asyncio.to_thread(
+                    detect_audio_peaks,
+                    source,
+                )
+
+                windows = select_clips(
+                    points,
+                    duration,
+                    s["length"],
+                    s["count"],
+                )
+
+                completed = 0
+
+                for index, (start, clip_length) in enumerate(
+                    windows, 1
+                ):
+                    await update_status(
+                        f"🎬 Rendering Short {index}/{len(windows)}..."
+                    )
+
+                    destination = str(
+                        Path(temp_folder) / f"short_{index}.mp4"
+                    )
+
+                    await asyncio.to_thread(
+                        render_short,
+                        source,
+                        start,
+                        clip_length,
+                        destination,
+                        s["style"],
+                    )
+
+                    if os.path.getsize(destination) > MAX_TG_UPLOAD:
+                        await bot.send_message(
+                            chat_id,
+                            f"⚠️ Short {index} is too large to send.",
+                        )
+                        continue
+
+                    with open(destination, "rb") as video:
+                        await bot.send_video(
+                            chat_id,
+                            video=video,
+                            width=OUT_W,
+                            height=OUT_H,
+                            duration=int(clip_length),
+                            caption=(
+                                f"✂️ ViralX Short {index}\n"
+                                f"Duration: {int(clip_length)}s\n"
+                                f"Source position: {int(start)}s"
+                            ),
+                            supports_streaming=True,
+                            read_timeout=300,
+                            write_timeout=300,
+                            connect_timeout=60,
+                        )
+
+                    completed += 1
+
+                await update_status(
+                    f"✅ Completed! {completed} Short(s) created."
+                )
+
+    except Exception as error:
+        log.exception("Video processing failed")
+        await update_status("❌ " + readable_error(error))
+
+    finally:
+        shutil.rmtree(temp_folder, ignore_errors=True)
+
+    await bot.send_message(
+        chat_id,
+        "What would you like to do next?",
+        reply_markup=main_menu(),
+    )
+
+
+# =====================================================
+# TELEGRAM COMMANDS
+# =====================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["mode"] = None
+
+    await update.effective_message.reply_text(
+        "🚀 WELCOME TO VIRALX AI STUDIO\n\n"
+        "Your video downloader and Shorts creation workspace.\n\n"
+        "Choose a service below:",
+        reply_markup=main_menu(),
+    )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["mode"] = None
+    context.user_data.pop("pending_url", None)
+
+    await update.effective_message.reply_text(
+        "Current selection cleared.",
+        reply_markup=main_menu(),
+    )
+
+
+# =====================================================
+# BUTTON HANDLER
+# =====================================================
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    user_data = context.user_data
+    s = get_settings(user_data)
+
+    async def edit(message, keyboard=None):
+        try:
+            await query.message.edit_text(
+                message,
+                reply_markup=keyboard,
+            )
+        except BadRequest:
+            pass
+
+    if data == "menu":
+        user_data["mode"] = None
         await edit(
-            "📊 Status\n\n"
-            f"Uptime: {up // 3600}h {(up % 3600) // 60}m\n"
-            f"Output: {OUT_W}x{OUT_H}\n"
-            f"YouTube cookies: {'loaded' if COOKIE_FILE else 'not set'}\n"
-            f"Autopilot: {'ON' if ud.get('autopilot') else 'OFF'} (publishing not connected)\n"
-            f"Settings: {s['count']} clips × {s['length']}s, {s['style']}",
-            back_kb())
-    elif d.startswith("go:"):
-        action = d.split(":")[1]
-        url = ud.pop("pending_url", None)
-        if not url:
-            await edit("Send the link again, please.", back_kb())
-            return
-        await edit("Starting...", None)
-        await run_job(context.bot, q.message.chat_id, ud, action, url=url)
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    m = URL_RE.search(msg.text or "")
-    if not m:
-        await msg.reply_text("Send me a video link, or tap /start for the menu.")
-        return
-    url = m.group(0)
-    ud = context.user_data
-    mode = ud.get("mode")
-    if mode in ("download", "shorts"):
-        await run_job(context.bot, msg.chat_id, ud, mode, url=url)
-    else:
-        ud["pending_url"] = url
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📥 Download", callback_data="go:download"),
-            InlineKeyboardButton("✂️ Make Shorts", callback_data="go:shorts"),
-        ]])
-        await msg.reply_text("What should I do with this link?", reply_markup=kb)
-
-
-async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    v = msg.video or msg.document
-    if v.file_size and v.file_size > MAX_TG_DOWNLOAD:
-        await msg.reply_text("⚠️ Telegram lets bots download files up to 20 MB only. "
-                             "Please send a link instead, or compress the video.")
-        return
-    await run_job(context.bot, msg.chat_id, context.user_data, "shorts", file_id=v.file_id)
-
-
-# ---------------------------------------------------------------- app
-tg_app = Application.builder().token(BOT_TOKEN).updater(None).concurrent_updates(True).build()
-tg_app.add_handler(CommandHandler(["start", "menu"], start))
-tg_app.add_handler(CallbackQueryHandler(on_button))
-tg_app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, on_video))
-tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await tg_app.initialize()
-    await tg_app.start()
-    if BASE_URL:
-        await tg_app.bot.set_webhook(
-            url=f"{BASE_URL.rstrip('/')}/webhook",
-            allowed_updates=Update.ALL_TYPES,
-            secret_token=WEBHOOK_SECRET or None,
+            "🚀 VIRALX AI STUDIO\n\nChoose your service:",
+            main_menu(),
         )
-        log.info("Webhook set to %s/webhook", BASE_URL.rstrip("/"))
-    yield
-    await tg_app.stop()
-    await tg_app.shutdown()
+
+    elif data.startswith("mode:"):
+        mode = data.split(":")[1]
+
+        user_data["mode"] = (
+            "shorts" if mode == "live" else mode
+        )
+
+        if mode == "download":
+            message = (
+                "📥 VIDEO DOWNLOADER\n\n"
+                "Send a supported video link."
+            )
+        elif mode == "live":
+            message = (
+                "📡 RECORDING TO SHORTS\n\n"
+                "Send an accessible recording link or upload a recording.\n"
+                "This processes recordings, not an active live stream."
+            )
+        else:
+            message = (
+                "✂️ VIDEO TO SHORTS\n\n"
+                "Send a video link or upload a video.\n\n"
+                f"Current settings: {s['count']} clips × "
+                f"{s['length']} seconds."
+            )
+
+        await edit(message, back_menu())
+
+    elif data == "settings":
+        await edit(
+            "🎛 EDITOR SETTINGS\n\n"
+            "Choose clip duration, clip count and framing:",
+            settings_menu(s),
+        )
+
+    elif data.startswith("len:"):
+        s["length"] = int(data.split(":")[1])
+        await edit("✅ Clip duration updated.", settings_menu(s))
+
+    elif data.startswith("count:"):
+        s["count"] = int(data.split(":")[1])
+        await edit("✅ Clip count updated.", settings_menu(s))
+
+    elif data.startswith("style:"):
+        s["style"] = data.split(":")[1]
+        await edit("✅ Framing style updated.", settings_menu(s))
+
+    elif data == "autopilot":
+        await edit(
+            "🤖 AUTOPILOT\n\n"
+            "Automatic publishing is not connected yet.\n"
+            "Official platform API connections are required.",
+            back_menu(),
+        )
+
+    elif data == "publish":
+        await edit(
+            "📤 PUBLISHING CENTER\n\n"
+            "YouTube, TikTok and Facebook publishing "
+            "require official platform API connections.",
+            back_menu(),
+        )
+
+    elif data == "status":
+        uptime = int(time.time() - START_TIME)
+
+        await edit(
+            "📊 VIRALX SYSTEM STATUS\n\n"
+            "System: Online\n"
+            f"Uptime: {uptime // 3600}h "
+            f"{(uptime % 3600) // 60}m\n"
+            f"Resolution: {OUT_W}x{OUT_H}\n"
+            f"Clip length: {s['length']} seconds\n"
+            f"Clip count: {s['count']}\n"
+            f"Frame style: {s['style']}\n"
+            "Video engine: FFmpeg\n"
+            "Downloader: yt-dlp",
+            back_menu(),
+        )
 
 
-app = FastAPI(lifespan=lifespan)
+# =====================================================
+# URL AND VIDEO HANDLERS
+# =====================================================
 
-
-@app.api_route("/", methods=["GET", "HEAD"])
-async def root():
-    return {"status": "ok", "bot": "ViralX AI Editor"}
-
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        return Response(status_code=403)
-    update = Update.de_json(await request.json(), tg_app.bot)
-    await tg_app.update_queue.put(update)
-    return Response(status_code=200)
+async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    

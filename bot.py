@@ -5,32 +5,30 @@ Telegram Universal Downloader + Video to Shorts
 FastAPI + Telegram Webhook + yt-dlp + FFmpeg
 """
 
-import os
-import re
-import time
 import asyncio
-import logging
-import shutil
-import tempfile
-import subprocess
-
-from pathlib import Path
 from contextlib import asynccontextmanager
-
-import yt_dlp
-import imageio_ffmpeg
+import logging
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+import time
 
 from fastapi import FastAPI, Request, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import imageio_ffmpeg
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
+import yt_dlp
 
 # =====================================================
 # CONFIGURATION
@@ -59,8 +57,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing in Render Environment")
 
 BASE_URL = (
-    os.getenv("PUBLIC_URL")
-    or os.getenv("RENDER_EXTERNAL_URL", "")
+    os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 ).rstrip("/")
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
@@ -723,4 +720,4 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def edit(message, keyboard=None):
         try:
             await query.message.edit_text(
-   
+         

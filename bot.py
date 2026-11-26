@@ -62,6 +62,17 @@ BASE_URL = (
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
+# =====================================================
+# TELEGRAM APPLICATION
+# =====================================================
+
+tg = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .updater(None)
+    .build()
+)
+
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 OUT_W = 720

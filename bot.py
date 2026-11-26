@@ -721,3 +721,153 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.message.edit_text(
          
+                message,
+                reply_markup=keyboard or main_menu(),
+            )
+        except TelegramError:
+            try:
+                await query.message.reply_text(
+                    message,
+                    reply_markup=keyboard or main_menu(),
+                )
+            except TelegramError:
+                pass
+
+    if data == "menu":
+        user_data["mode"] = None
+        user_data.pop("pending_url", None)
+        await edit("ViralX AI Editor\n\nChoose an option:", main_menu())
+
+    elif data == "cancel":
+        user_data["mode"] = None
+        user_data.pop("pending_url", None)
+        await edit("Current selection cleared.", main_menu())
+
+    elif data == "download":
+        user_data["mode"] = "download"
+        await edit(
+            "Send me a video URL to download.",
+            main_menu(),
+        )
+
+    elif data == "shorts":
+        user_data["mode"] = "shorts"
+        await edit(
+            "Send me a video URL to create Shorts.",
+            main_menu(),
+        )
+
+    elif data == "settings":
+        await edit(
+            "Editor Settings\n\nChoose an option:",
+            settings_menu(),
+        )
+
+    elif data == "back":
+        await edit("Main Menu:", main_menu())
+
+    else:
+        await edit("Unknown option. Please choose again.", main_menu())
+
+
+# =====================================================
+# TEXT MESSAGE HANDLER
+# =====================================================
+
+async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.effective_message.text or "").strip()
+
+    if not text:
+        return
+
+    mode = context.user_data.get("mode")
+
+    if mode in ("download", "shorts"):
+        if not text.startswith(("http://", "https://")):
+            await update.effective_message.reply_text(
+                "Please send a valid video URL."
+            )
+            return
+
+        context.user_data["pending_url"] = text
+
+        await update.effective_message.reply_text(
+            "URL received. Processing will be handled by the video worker."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Please choose an option from the menu.",
+        reply_markup=main_menu(),
+)
+    
+# =====================================================
+# VIDEO MESSAGE HANDLER
+# =====================================================
+
+async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Please send a supported video URL using the Download or Shorts menu."
+    )
+
+
+# =====================================================
+# ERROR HANDLER
+# =====================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Bot error:", exc_info=context.error)
+
+
+# =====================================================
+# FASTAPI APPLICATION
+# =====================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await tg.initialize()
+    await tg.start()
+
+    webhook_url = f"{BASE_URL}/webhook"
+    await tg.bot.set_webhook(webhook_url)
+
+    logger.info("ViralX webhook started: %s", webhook_url)
+
+    yield
+
+    await tg.bot.delete_webhook()
+    await tg.stop()
+    await tg.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/")
+async def home():
+    return {"status": "ViralX AI Editor is running"}
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    try:
+        data = await request.json()
+        update = Update.de_json(data, tg.bot)
+        await tg.process_update(update)
+        return {"ok": True}
+    except Exception:
+        logger.exception("Webhook error")
+        return {"ok": False}
+
+
+# =====================================================
+# HANDLER REGISTRATION
+# =====================================================
+
+tg.add_handler(CommandHandler("start", start))
+tg.add_handler(CommandHandler("cancel", cancel))
+tg.add_handler(CallbackQueryHandler(buttons))
+tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text))
+tg.add_handler(MessageHandler(filters.VIDEO, receive_video))
+tg.add_error_handler(error_handler)
+            

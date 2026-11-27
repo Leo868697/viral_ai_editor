@@ -721,164 +721,381 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # "Query is too old". That must never break the handler.
     try:
         await query.answer()
-    except TelegramError:
+    
         pass
 
     data = query.data or ""
-    user_data = context.user_data
-    s = get_settings(user_data)
-
-    async def edit(message, keyboard=None):
-        try:
-            await query.message.edit_text(
-         
-                message,
-                reply_markup=keyboard or main_menu(),
-            )
-        except TelegramError:
-            try:
-                await query.message.reply_text(
-                    message,
-                    reply_markup=keyboard or main_menu(),
-                )
-            except TelegramError:
-                pass
+    s = get_settings(context.user_data)
 
     if data == "menu":
-        user_data["mode"] = None
-        user_data.pop("pending_url", None)
-        await edit("ViralX AI Editor\n\nChoose an option:", main_menu())
-
-    elif data == "cancel":
-        user_data["mode"] = None
-        user_data.pop("pending_url", None)
-        await edit("Current selection cleared.", main_menu())
-
-    elif data == "download":
-        user_data["mode"] = "download"
-        await edit(
-            "Send me a video URL to download.",
-            main_menu(),
+        await query.edit_message_text(
+            "Choose a service:",
+            reply_markup=main_menu()
         )
 
-    elif data == "shorts":
-        user_data["mode"] = "shorts"
-        await edit(
-            "Send me a video URL to create Shorts.",
-            main_menu(),
+    elif data == "mode:download":
+        context.user_data["mode"] = "download"
+        await query.edit_message_text(
+            "📥 Send your supported download link.\n"
+            "YouTube is disabled."
+        )
+
+    elif data == "mode:shorts":
+        context.user_data["mode"] = "shorts"
+        await query.edit_message_text(
+            "✂️ Send a video link or upload a video."
         )
 
     elif data == "settings":
-        await edit(
-            "Editor Settings\n\nChoose an option:",
-            settings_menu(),
+        await query.edit_message_text(
+            "🎛 EDITOR SETTINGS",
+            reply_markup=settings_menu(s)
         )
 
-    elif data == "back":
-        await edit("Main Menu:", main_menu())
+    elif data.startswith("length:"):
+        s["length"] = int(data.split(":")[1])
+        await query.edit_message_reply_markup(
+            reply_markup=settings_menu(s)
+        )
+
+    elif data.startswith("count:"):
+        s["count"] = int(data.split(":")[1])
+        await query.edit_message_reply_markup(
+            reply_markup=settings_menu(s)
+        )
+
+    elif data.startswith("style:"):
+        s["style"] = data.split(":")[1]
+        await query.edit_message_reply_markup(
+            reply_markup=settings_menu(s)
+        )
+
+    elif data == "status":
+        await query.edit_message_text(
+            "🟢 VIRALX ONLINE\n"
+            f"Source limit: {MAX_SOURCE_MB} MB\n"
+            f"Telegram delivery limit: {MAX_TG_UPLOAD_MB} MB",
+            reply_markup=main_menu()
+        )
+
+
+def get_duration(path):
+    result = subprocess.run(
+        [FFMPEG, "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=60
+    )
+
+    match = re.search(
+        r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
+        result.stderr
+    )
+
+    if not match:
+        raise ValueError("Cannot read video duration.")
+
+    h, m, sec = match.groups()
+    return int(h) * 3600 + int(m) * 60 + float(sec)
+
+
+def choose_windows(duration, length, count):
+    length = min(float(length), duration)
+
+    if duration <= length:
+        return [(0.0, duration)]
+
+    if count == 1:
+        return [((duration - length) / 2, length)]
+
+    return [
+        (
+            i * (duration - length) / (count - 1),
+            length
+        )
+        for i in range(count)
+    ]
+
+
+def render_short(source, start, length, output, style):
+    if style == "fill":
+        vf = (
+            "scale=720:1280:"
+            "force_original_aspect_ratio=increase,"
+            "crop=720:1280"
+        )
+        options = ["-vf", vf]
 
     else:
-        await edit("Unknown option. Please choose again.", main_menu())
-
-
-# =====================================================
-# TEXT MESSAGE HANDLER
-# =====================================================
-
-async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.effective_message.text or "").strip()
-
-    if not text:
-        return
-
-    mode = context.user_data.get("mode")
-
-    if mode in ("download", "shorts"):
-        if not text.startswith(("http://", "https://")):
-            await update.effective_message.reply_text(
-                "Please send a valid video URL."
-            )
-            return
-
-        context.user_data["pending_url"] = text
-
-        await update.effective_message.reply_text(
-            "URL received. Processing will be handled by the video worker."
+        vf = (
+            "[0:v]split=2[bg][fg];"
+            "[bg]scale=720:1280:"
+            "force_original_aspect_ratio=increase,"
+            "crop=720:1280,boxblur=22:8[blur];"
+            "[fg]scale=720:1280:"
+            "force_original_aspect_ratio=decrease[front];"
+            "[blur][front]overlay=(W-w)/2:(H-h)/2[v]"
         )
-        return
+        options = [
+            "-filter_complex", vf,
+            "-map", "[v]",
+            "-map", "0:a?"
+        ]
 
-    await update.effective_message.reply_text(
-        "Please choose an option from the menu.",
-        reply_markup=main_menu(),
-)
-    
-# =====================================================
-# VIDEO MESSAGE HANDLER
-# =====================================================
+    command = [
+        FFMPEG, "-y",
+        "-ss", str(start),
+        "-i", str(source),
+        "-t", str(length)
+    ] + options + [
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "27",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(output)
+    ]
 
-async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Please send a supported video URL using the Download or Shorts menu."
+    subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        timeout=1800
     )
 
 
-# =====================================================
-# ERROR HANDLER
-# =====================================================
+async def process_job(
+    application,
+    chat_id,
+    user_data,
+    url=None,
+    file_id=None,
+    action="download"
+):
+    bot = application.bot
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Bot error:", exc_info=context.error)
+    status = await bot.send_message(
+        chat_id,
+        "⏳ Your job is waiting..."
+    )
 
+    folder = Path(tempfile.mkdtemp(prefix="viralx_"))
 
-# =====================================================
-# FASTAPI APPLICATION
-# =====================================================
+    try:
+        async with JOB_LOCK:
+
+            if file_id:
+                await status.edit_text(
+                    "📥 Receiving uploaded video..."
+                )
+
+                telegram_file = await bot.get_file(file_id)
+
+                source = folder / "uploaded_video.mp4"
+
+                await telegram_file.download_to_drive(
+                    custom_path=str(source)
+                )
+
+                title = "Uploaded Video"
+
+            else:
+                await status.edit_text(
+                    "🌐 Downloading your file..."
+                )
+
+                source, title, info = await asyncio.to_thread(
+                    download_any,
+                    url,
+                    folder,
+                    MAX_SOURCE_MB * 1024 * 1024
+                )
+
+            size = source.stat().st_size
+
+            if size > MAX_SOURCE_MB * 1024 * 1024:
+                raise ValueError(
+                    "Source file exceeds configured limit."
+                )
+
+            if action == "download":
+
+                if size > MAX_TG_UPLOAD_MB * 1024 * 1024:
+                    raise ValueError(
+                        "File exceeds Telegram delivery limit."
+                    )
+
+                await status.edit_text(
+                    "📤 Sending your file..."
+                )
+
+                with source.open("rb") as file:
+                    await bot.send_document(
+                        chat_id,
+                        document=file,
+                        filename=source.name,
+                        caption=str(title)[:900]
+                    )
+
+                await status.edit_text(
+                    "✅ Download complete!"
+                )
+
+            else:
+                await status.edit_text(
+                    "🎬 Preparing Shorts..."
+                )
+
+                duration = await asyncio.to_thread(
+                    get_duration,
+                    source
+                )
+
+                if duration < 1 or duration > MAX_DURATION:
+                    raise ValueError(
+                        "Video must be 1 second to 10 hours."
+                    )
+
+                s = user_data.get(
+                    "settings",
+                    DEFAULT_SETTINGS
+                )
+
+                windows = choose_windows(
+                    duration,
+                    s["length"],
+                    s["count"]
+                )
+
+                completed = 0
+
+                for index, (start, length) in enumerate(
+                    windows, 1
+                ):
+                    await status.edit_text(
+                        f"🎬 Rendering Short {index}/{len(windows)}..."
+                    )
+
+                    output = folder / f"short_{index}.mp4"
+
+                    await asyncio.to_thread(
+                        render_short,
+                        source,
+                        start,
+                        length,
+                        output,
+                        s["style"]
+                    )
+
+                    if output.stat().st_size > MAX_TG_UPLOAD_MB * 1024 * 1024:
+                        continue
+
+                    with output.open("rb") as file:
+                        await bot.send_video(
+                            chat_id,
+                            video=file,
+                            caption=f"✂️ VIRALX SHORT {index}",
+                            supports_streaming=True,
+                            read_timeout=300,
+                            write_timeout=300
+                        )
+
+                    completed += 1
+
+                await status.edit_text(
+                    f"✅ Completed! {completed} Shorts created."
+                )
+
+    except Exception as error:
+        log.exception("Processing failed")
+
+        try:
+            await status.edit_text(
+                "❌ " + str(error)[:900]
+            )
+        except TelegramError:
+            pass
+
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+        try:
+            await bot.send_message(
+                chat_id,
+                "What would you like to do next?",
+                reply_markup=main_menu()
+            )
+        except TelegramError:
+            pass
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await tg.initialize()
     await tg.start()
 
-    webhook_url = f"{BASE_URL}/webhook"
-    await tg.bot.set_webhook(webhook_url)
-
-    logger.info("ViralX webhook started: %s", webhook_url)
+    if PUBLIC_URL:
+        await tg.bot.set_webhook(
+            url=f"{PUBLIC_URL}/telegram",
+            secret_token=WEBHOOK_SECRET or None,
+            drop_pending_updates=True
+        )
 
     yield
 
-    await tg.bot.delete_webhook()
+    if PUBLIC_URL:
+        await tg.bot.delete_webhook()
+
     await tg.stop()
     await tg.shutdown()
 
+
+tg = ApplicationBuilder().token(TOKEN).updater(None).build()
+
+tg.add_handler(CommandHandler("start", start))
+tg.add_handler(CommandHandler("cancel", cancel))
+tg.add_handler(CallbackQueryHandler(buttons))
+tg.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_text
+    )
+)
+tg.add_handler(
+    MessageHandler(
+        filters.VIDEO | filters.Document.ALL,
+        handle_video
+    )
+)
 
 app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/")
-async def home():
-    return {"status": "ViralX AI Editor is running"}
+async def health():
+    return {
+        "status": "online",
+        "service": "VIRALX AI STUDIO",
+        "version": "1.2"
+    }
 
 
-@app.post("/webhook")
+@app.post("/telegram")
 async def webhook(request: Request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, tg.bot)
-        await tg.process_update(update)
-        return {"ok": True}
-    except Exception:
-        logger.exception("Webhook error")
-        return {"ok": False}
+    if WEBHOOK_SECRET:
+        supplied = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token",
+            ""
+        )
 
+        if supplied != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403)
 
-# =====================================================
-# HANDLER REGISTRATION
-# =====================================================
+    payload = await request.json()
+    update = Update.de_json(payload, tg.bot)
 
-tg.add_handler(CommandHandler("start", start))
-tg.add_handler(CommandHandler("cancel", cancel))
-tg.add_handler(CallbackQueryHandler(buttons))
-tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text))
-tg.add_handler(MessageHandler(filters.VIDEO, receive_video))
-tg.add_error_handler(error_handler)
-            
+    await tg.process_update(update)
+
+    return {"ok": True}
